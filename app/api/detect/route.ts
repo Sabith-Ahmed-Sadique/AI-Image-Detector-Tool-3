@@ -2,10 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Extend Vercel function timeout limit to allow HF model cold starts (up to 60s)
+export const maxDuration = 60;
 
-// Primary and fallback Hugging Face inference endpoints
-const PRIMARY_HF_URL = "https://router.huggingface.co/hf-inference/models/umm-maybe/AI-image-detector";
-const FALLBACK_HF_URL = "https://api-inference.huggingface.co/models/umm-maybe/AI-image-detector";
+const HF_MODEL = "umm-maybe/AI-image-detector";
+const HF_URL = `https://api-inference.huggingface.co/models/${HF_MODEL}`;
 
 const ALLOWED_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp"];
 const MAX_BYTES = 10 * 1024 * 1024; // 10MB
@@ -28,7 +29,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           error: "missing_api_key",
-          message: "HUGGINGFACE_API_KEY is missing. Please add it to your Vercel Environment Variables.",
+          message: "HUGGINGFACE_API_KEY is not set in Vercel Environment Variables.",
         },
         { status: 500 }
       );
@@ -39,7 +40,7 @@ export async function POST(req: NextRequest) {
 
     if (!file || !(file instanceof File)) {
       return NextResponse.json(
-        { error: "no_file", message: "No image file provided." },
+        { error: "no_file", message: "No image was uploaded." },
         { status: 400 }
       );
     }
@@ -53,82 +54,67 @@ export async function POST(req: NextRequest) {
 
     if (file.size > MAX_BYTES) {
       return NextResponse.json(
-        { error: "file_too_large", message: "File exceeds 10MB limit." },
+        { error: "file_too_large", message: "Image exceeds the 10MB limit." },
         { status: 400 }
       );
     }
 
-    const arrayBuffer = await file.arrayBuffer();
+    const bytes = await file.arrayBuffer();
+    const buffer = Buffer.from(bytes);
 
-    // Attempt inference with primary and fallback endpoints
-    let hfResponse: Response | null = null;
-    const urls = [PRIMARY_HF_URL, FALLBACK_HF_URL];
+    const response = await fetch(HF_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey.trim()}`,
+        "Content-Type": file.type || "application/octet-stream",
+        "x-use-cache": "false",
+      },
+      body: buffer,
+    });
 
-    for (const url of urls) {
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey.trim()}`,
-            "Content-Type": file.type || "application/octet-stream",
-          },
-          body: arrayBuffer,
-        });
-        if (res.ok || res.status === 503 || res.status === 401 || res.status === 403) {
-          hfResponse = res;
-          break;
-        }
-      } catch {
-        continue;
-      }
-    }
-
-    if (!hfResponse) {
-      return NextResponse.json(
-        { error: "network_error", message: "Unable to connect to Hugging Face Inference servers." },
-        { status: 502 }
-      );
-    }
-
-    if (hfResponse.status === 503) {
-      let estimatedTime = 20;
-      try {
-        const body = await hfResponse.json();
-        if (typeof body?.estimated_time === "number") estimatedTime = Math.ceil(body.estimated_time);
-      } catch {}
+    // Model is spinning up on Hugging Face (Cold start)
+    if (response.status === 503) {
+      const data = await response.json().catch(() => ({}));
+      const waitTime = Math.ceil(data?.estimated_time || 20);
       return NextResponse.json(
         {
           error: "model_loading",
-          message: "Model is warming up on Hugging Face. Retrying shortly...",
-          estimated_time: estimatedTime,
+          message: `Model is warming up on Hugging Face. Retrying in ${waitTime}s...`,
+          estimated_time: waitTime,
         },
         { status: 503 }
       );
     }
 
-    if (hfResponse.status === 401 || hfResponse.status === 403) {
+    if (response.status === 401 || response.status === 403) {
       return NextResponse.json(
         {
           error: "unauthorized",
-          message: "Invalid Hugging Face API key. Check the key in Vercel Settings.",
+          message: "Invalid Hugging Face API key. Verify your token under Vercel Settings.",
         },
         { status: 401 }
       );
     }
 
-    if (!hfResponse.ok) {
-      const errorText = await hfResponse.text().catch(() => "");
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
       return NextResponse.json(
-        { error: "inference_failed", message: `Hugging Face error (${hfResponse.status}): ${errorText.slice(0, 200)}` },
+        {
+          error: "inference_failed",
+          message: `Hugging Face Error (${response.status}): ${errorText.slice(0, 200)}`,
+        },
         { status: 502 }
       );
     }
 
-    const result = await hfResponse.json();
+    const result = await response.json();
 
     if (!Array.isArray(result)) {
       return NextResponse.json(
-        { error: "unexpected_response", message: result?.error || "Unexpected response shape." },
+        {
+          error: "unexpected_response",
+          message: result?.error || "Unexpected response shape from model.",
+        },
         { status: 502 }
       );
     }
@@ -139,7 +125,7 @@ export async function POST(req: NextRequest) {
 
     if (breakdown.length === 0) {
       return NextResponse.json(
-        { error: "empty_response", message: "No classification returned." },
+        { error: "empty_response", message: "No classification returned by the model." },
         { status: 502 }
       );
     }
@@ -167,11 +153,14 @@ export async function POST(req: NextRequest) {
       breakdown: breakdown
         .map((b) => ({ label: b.label, score: Math.round(b.score * 1000) / 10 }))
         .sort((a, b) => b.score - a.score),
-      model: "umm-maybe/AI-image-detector",
+      model: HF_MODEL,
     });
   } catch (err: any) {
     return NextResponse.json(
-      { error: "server_error", message: err.message || "Internal server error." },
+      {
+        error: "server_error",
+        message: err.message || "An unexpected server error occurred.",
+      },
       { status: 500 }
     );
   }
