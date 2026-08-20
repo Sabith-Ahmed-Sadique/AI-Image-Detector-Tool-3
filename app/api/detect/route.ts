@@ -1,12 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Force Node.js runtime (we need Buffer + full fetch control, not the Edge runtime).
 export const runtime = "nodejs";
-// Never cache detection results.
 export const dynamic = "force-dynamic";
 
-const HF_MODEL_URL =
-  "https://api-inference.huggingface.co/models/umm-maybe/AI-image-detector";
+// Primary and fallback Hugging Face inference endpoints
+const PRIMARY_HF_URL = "https://router.huggingface.co/hf-inference/models/umm-maybe/AI-image-detector";
+const FALLBACK_HF_URL = "https://api-inference.huggingface.co/models/umm-maybe/AI-image-detector";
 
 const ALLOWED_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp"];
 const MAX_BYTES = 10 * 1024 * 1024; // 10MB
@@ -29,97 +28,78 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           error: "missing_api_key",
-          message:
-            "HUGGINGFACE_API_KEY is not configured on the server. Add it in your Vercel project's Environment Variables.",
+          message: "HUGGINGFACE_API_KEY is missing. Please add it to your Vercel Environment Variables.",
         },
         { status: 500 }
       );
     }
 
-    let formData: FormData;
-    try {
-      formData = await req.formData();
-    } catch {
-      return NextResponse.json(
-        { error: "bad_request", message: "Could not parse multipart form data." },
-        { status: 400 }
-      );
-    }
-
+    const formData = await req.formData();
     const file = formData.get("image");
 
     if (!file || !(file instanceof File)) {
       return NextResponse.json(
-        { error: "no_file", message: "No image file was provided under the 'image' field." },
+        { error: "no_file", message: "No image file provided." },
         { status: 400 }
       );
     }
 
     if (!ALLOWED_TYPES.includes(file.type)) {
       return NextResponse.json(
-        {
-          error: "invalid_type",
-          message: `Unsupported file type "${file.type}". Please upload PNG, JPG, or WEBP.`,
-        },
+        { error: "invalid_type", message: `Unsupported file type: ${file.type}` },
         { status: 400 }
       );
     }
 
     if (file.size > MAX_BYTES) {
       return NextResponse.json(
-        { error: "file_too_large", message: "File exceeds the 10MB limit." },
+        { error: "file_too_large", message: "File exceeds 10MB limit." },
         { status: 400 }
       );
     }
 
-    let arrayBuffer: ArrayBuffer;
-    try {
-      arrayBuffer = await file.arrayBuffer();
-    } catch {
-      return NextResponse.json(
-        { error: "unreadable_file", message: "The uploaded file could not be read." },
-        { status: 400 }
-      );
+    const arrayBuffer = await file.arrayBuffer();
+
+    // Attempt inference with primary and fallback endpoints
+    let hfResponse: Response | null = null;
+    const urls = [PRIMARY_HF_URL, FALLBACK_HF_URL];
+
+    for (const url of urls) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey.trim()}`,
+            "Content-Type": file.type || "application/octet-stream",
+          },
+          body: arrayBuffer,
+        });
+        if (res.ok || res.status === 503 || res.status === 401 || res.status === 403) {
+          hfResponse = res;
+          break;
+        }
+      } catch {
+        continue;
+      }
     }
 
-    const buffer = Buffer.from(arrayBuffer);
-
-    let hfResponse: Response;
-    try {
-      hfResponse = await fetch(HF_MODEL_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": file.type,
-        },
-        body: buffer,
-      });
-    } catch (networkErr) {
+    if (!hfResponse) {
       return NextResponse.json(
-        {
-          error: "network_error",
-          message: "Could not reach the Hugging Face Inference API.",
-          detail: networkErr instanceof Error ? networkErr.message : String(networkErr),
-        },
+        { error: "network_error", message: "Unable to connect to Hugging Face Inference servers." },
         { status: 502 }
       );
     }
 
-    // Cold start: model is still loading on Hugging Face's side.
     if (hfResponse.status === 503) {
       let estimatedTime = 20;
       try {
         const body = await hfResponse.json();
-        if (typeof body?.estimated_time === "number") {
-          estimatedTime = Math.ceil(body.estimated_time);
-        }
-      } catch {
-        // ignore, fall back to default estimate
-      }
+        if (typeof body?.estimated_time === "number") estimatedTime = Math.ceil(body.estimated_time);
+      } catch {}
       return NextResponse.json(
         {
           error: "model_loading",
-          message: "The model is warming up on Hugging Face's free tier. Please retry shortly.",
+          message: "Model is warming up on Hugging Face. Retrying shortly...",
           estimated_time: estimatedTime,
         },
         { status: 503 }
@@ -130,20 +110,16 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           error: "unauthorized",
-          message: "Hugging Face rejected the API key. Verify HUGGINGFACE_API_KEY is valid.",
+          message: "Invalid Hugging Face API key. Check the key in Vercel Settings.",
         },
-        { status: 502 }
+        { status: 401 }
       );
     }
 
     if (!hfResponse.ok) {
-      const detail = await hfResponse.text().catch(() => "");
+      const errorText = await hfResponse.text().catch(() => "");
       return NextResponse.json(
-        {
-          error: "inference_failed",
-          message: `Hugging Face Inference API returned status ${hfResponse.status}.`,
-          detail: detail.slice(0, 500),
-        },
+        { error: "inference_failed", message: `Hugging Face error (${hfResponse.status}): ${errorText.slice(0, 200)}` },
         { status: 502 }
       );
     }
@@ -151,10 +127,10 @@ export async function POST(req: NextRequest) {
     const result = await hfResponse.json();
 
     if (!Array.isArray(result)) {
-      // The API sometimes wraps errors as an object instead of an array.
-      const message =
-        typeof result?.error === "string" ? result.error : "Unexpected response shape from model.";
-      return NextResponse.json({ error: "unexpected_response", message }, { status: 502 });
+      return NextResponse.json(
+        { error: "unexpected_response", message: result?.error || "Unexpected response shape." },
+        { status: 502 }
+      );
     }
 
     const breakdown: HFLabelScore[] = result
@@ -163,7 +139,7 @@ export async function POST(req: NextRequest) {
 
     if (breakdown.length === 0) {
       return NextResponse.json(
-        { error: "empty_response", message: "The model returned no classification labels." },
+        { error: "empty_response", message: "No classification returned." },
         { status: 502 }
       );
     }
@@ -173,17 +149,16 @@ export async function POST(req: NextRequest) {
     );
     const humanEntry = breakdown.find((r) => /human|real|authentic/i.test(r.label));
 
-    let aiScoreRaw: number;
+    let aiScoreRaw = 0;
     if (artificialEntry) {
       aiScoreRaw = artificialEntry.score;
     } else if (humanEntry) {
       aiScoreRaw = 1 - humanEntry.score;
     } else {
-      // Fallback: assume the highest-confidence label at index 0 represents "artificial".
       aiScoreRaw = breakdown[0].score;
     }
 
-    const aiScore = Math.round(aiScoreRaw * 1000) / 10; // one decimal place, 0-100
+    const aiScore = Math.round(aiScoreRaw * 1000) / 10;
     const verdict = classifyVerdict(aiScore);
 
     return NextResponse.json({
@@ -194,14 +169,9 @@ export async function POST(req: NextRequest) {
         .sort((a, b) => b.score - a.score),
       model: "umm-maybe/AI-image-detector",
     });
-  } catch (err) {
-    console.error("[/api/detect] unhandled error:", err);
+  } catch (err: any) {
     return NextResponse.json(
-      {
-        error: "server_error",
-        message: "An unexpected error occurred while analyzing the image.",
-        detail: err instanceof Error ? err.message : String(err),
-      },
+      { error: "server_error", message: err.message || "Internal server error." },
       { status: 500 }
     );
   }
