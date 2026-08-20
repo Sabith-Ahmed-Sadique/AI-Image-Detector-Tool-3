@@ -2,18 +2,18 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60; 
 
 const HF_MODEL_URL = "https://api-inference.huggingface.co/models/umm-maybe/AI-image-detector";
 
 export async function POST(req: NextRequest) {
   try {
     const apiKey = process.env.HUGGINGFACE_API_KEY || "";
-    // Strips out any accidental spaces or hidden newline characters from your token
     const cleanKey = apiKey.replace(/\s+/g, "");
 
     if (!cleanKey) {
       return NextResponse.json(
-        { error: "missing_key", message: "Hugging Face API key is missing in Vercel settings." },
+        { error: "missing_key", message: "API key is missing in Vercel." },
         { status: 500 }
       );
     }
@@ -28,22 +28,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Force strict Node Buffer to prevent Next.js 15 serialization crashes
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
     let hfResponse: Response;
     try {
+      // FIX: Pass the native Web 'File' object directly to the body.
+      // Do not convert to Buffer or ArrayBuffer, which crashes Next.js 15.
       hfResponse = await fetch(HF_MODEL_URL, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${cleanKey}`,
           "Content-Type": file.type || "image/jpeg",
         },
-        body: buffer,
+        body: file,
+        cache: "no-store" // Prevent Next.js from aggressively caching the request
       });
     } catch (networkErr: any) {
-      // If it crashes now, the exact reason will show up on your webpage
       return NextResponse.json(
         {
           error: "network_error",
@@ -53,19 +51,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Handle Cold Starts (Hugging Face takes time to boot up free models)
     if (hfResponse.status === 503) {
       return NextResponse.json(
         {
           error: "model_loading",
-          message: "The AI model is currently warming up on Hugging Face. Please wait 15 seconds and click Analyze again.",
+          message: "The AI model is warming up on Hugging Face. Please wait 15 seconds and click Analyze again.",
           estimated_time: 15,
         },
         { status: 503 }
       );
     }
 
-    // Handle API Rejections (e.g., bad token, rate limits)
     if (!hfResponse.ok) {
       const detail = await hfResponse.text().catch(() => "");
       return NextResponse.json(
@@ -86,7 +82,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Map the results
     const artificialEntry = result.find((r: any) => /artificial|fake|ai/i.test(r.label));
     const humanEntry = result.find((r: any) => /human|real/i.test(r.label));
 
